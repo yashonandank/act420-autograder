@@ -1,12 +1,14 @@
+# already present
 streamlit>=1.35
 pandas>=2.2
 openpyxl>=3.1
 jsonschema>=4.22
-# bcrypt is optional now; keep/remove as you wish
-bcrypt>=4.1
-
-# Notebook execution (needed for Step 2)
 nbformat>=5.9
 nbclient>=0.9
 nbconvert>=7.10
 jinja2>=3.1
+
+# add these ↓
+ipykernel>=6.29
+jupyter_client>=8.6
+jupyter_core>=5.7
