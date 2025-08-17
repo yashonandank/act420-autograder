@@ -1,17 +1,19 @@
 # app.py
+import io
 import json
 import time
+import zipfile
 import pandas as pd
 import streamlit as st
-from jsonschema import validate, ValidationError
-import zipfile, io
-from src.notebook_exec import run_ipynb_bytes
+
 from src.segmentor import split_sections
+from src.notebook_exec import run_ipynb_bytes
+from src.rubric_schema import load_rubric_json, load_rubric_excel
 
 # ----------------------------
 # Page setup
 # ----------------------------
-st.set_page_config(layout="wide", page_title="Analytics Autograder — Step 1")
+st.set_page_config(layout="wide", page_title="Analytics Autograder")
 
 # ----------------------------
 # Simple login (plain secrets)
@@ -34,7 +36,7 @@ def check_login() -> bool:
     if not users:
         st.warning(
             "No users found in Secrets. Add a [users] block in "
-            "`.streamlit/secrets.toml` (local) or the Cloud Secrets UI."
+            "`.streamlit/secrets.toml` (local) or in the Streamlit Cloud Secrets UI."
         )
 
     with st.form("login"):
@@ -53,6 +55,7 @@ def check_login() -> bool:
 
 def logout_button():
     with st.sidebar:
+        st.caption("Session")
         if st.button("Log out"):
             st.session_state.pop(SESSION_KEY, None)
             st.rerun()
@@ -62,107 +65,27 @@ check_login()
 logout_button()
 
 # ----------------------------
-# Rubric schema + loaders
+# Title
 # ----------------------------
-RUBRIC_SCHEMA = {
-    "type": "object",
-    "required": ["sections"],
-    "properties": {
-        "sections": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "required": ["id", "points", "criteria"],
-                "properties": {
-                    "id": {"type": "string", "pattern": "^Q\\d+$"},
-                    "title": {"type": "string"},
-                    "points": {"type": "number", "minimum": 0},
-                    "criteria": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "required": ["id", "type", "max"],
-                            "properties": {
-                                "id": {"type": "string"},
-                                "criterion": {"type": "string"},
-                                "type": {
-                                    "enum": [
-                                        "columns",
-                                        "row_count",
-                                        "stat_range",
-                                        "unique_count",
-                                        "null_rate",
-                                        "table_shape",
-                                        "figure_exists",
-                                        "llm_feedback",
-                                    ]
-                                },
-                                "args": {"type": "object"},
-                                "max": {"type": "number", "minimum": 0},
-                                "auto_only": {"type": ["boolean", "null"]},
-                                "bonus_cap": {"type": ["number", "null"]},
-                            },
-                        },
-                    },
-                },
-            },
-        }
-    },
-}
+st.title("📊 Analytics Notebook Autograder")
+st.caption("Step 1–2: Login + rubric upload/validation + notebook execution & section detection")
 
-def load_rubric_json(file_obj):
-    data = json.load(file_obj)
-    validate(instance=data, schema=RUBRIC_SCHEMA)
-    return data
+# ----------------------------
+# Rubric upload/validate/preview
+# ----------------------------
+with st.expander("➡️ Excel rubric template format"):
+    st.write(
+        "- **Sections** sheet: `section_id`, `title`, `points`, `order`\n"
+        "- **Criteria** sheet: `section_id`, `criterion_id`, `label`, `type`, `args_json`, `max_points`, `auto_only`, `bonus_cap`\n"
+        "- Allowed `type`: `columns`, `row_count`, `stat_range`, `unique_count`, `null_rate`, `table_shape`, `figure_exists`, `llm_feedback`"
+    )
 
-def load_rubric_excel(file_obj):
-    x = pd.ExcelFile(file_obj)
-    sections = pd.read_excel(x, "Sections").fillna("")
-    criteria = pd.read_excel(x, "Criteria").fillna("")
-    sections["section_id"] = sections["section_id"].astype(str).str.strip()
-    criteria["section_id"] = criteria["section_id"].astype(str).str.strip()
-
-    out = {"sections": []}
-    if "order" in sections.columns:
-        sections = sections.sort_values("order")
-
-    for _, s in sections.iterrows():
-        sec_id = str(s["section_id"])
-        pts = float(s.get("points", 0) or 0)
-        title = str(s.get("title", ""))
-        subset = criteria[criteria["section_id"] == sec_id]
-        rows = []
-        for _, c in subset.iterrows():
-            args = {}
-            sargs = str(c.get("args_json", "")).strip()
-            if sargs:
-                try:
-                    args = json.loads(sargs)
-                except Exception as e:
-                    raise ValidationError(
-                        f"Invalid args_json for criterion_id={c.get('criterion_id')}: {e}"
-                    )
-            rows.append(
-                {
-                    "id": str(c.get("criterion_id")),
-                    "criterion": str(c.get("label", "")),
-                    "type": str(c.get("type")),
-                    "args": args,
-                    "max": float(c.get("max_points", 0) or 0),
-                    "auto_only": bool(c.get("auto_only"))
-                    if str(c.get("auto_only", "")).strip() != ""
-                    else None,
-                    "bonus_cap": float(c.get("bonus_cap", 0))
-                    if str(c.get("bonus_cap", "")).strip() != ""
-                    else None,
-                }
-            )
-        out["sections"].append(
-            {"id": sec_id, "title": title, "points": pts, "criteria": rows}
-        )
-
-    validate(instance=out, schema=RUBRIC_SCHEMA)
-    return out
+st.subheader("Upload Rubric")
+rubric_file = st.file_uploader(
+    "Upload `rubric.json` **or** an Excel rubric (must include the sheets above)",
+    type=["json", "xlsx"],
+    key="rubric_uploader"
+)
 
 def preview_rubric(rubric: dict):
     # Top summary
@@ -194,24 +117,14 @@ def preview_rubric(rubric: dict):
             )
             st.dataframe(df, use_container_width=True, hide_index=True)
 
-# ----------------------------
-# Main UI
-# ----------------------------
-st.title("📊 Analytics Notebook Autograder — Step 1")
-st.caption("Login + rubric upload/validate/preview. (Execution & grading come next.)")
-
-with st.expander("➡️ Excel rubric template (what columns it expects)"):
-    st.write(
-        "- **Sections** sheet: `section_id`, `title`, `points`, `order`\n"
-        "- **Criteria** sheet: `section_id`, `criterion_id`, `label`, `type`, `args_json`, `max_points`, `auto_only`, `bonus_cap`\n"
-        "- Allowed `type`: `columns`, `row_count`, `stat_range`, `unique_count`, `null_rate`, `table_shape`, `figure_exists`, `llm_feedback`"
-    )
-
-st.subheader("Upload Rubric")
-rubric_file = st.file_uploader(
-    "Upload `rubric.json` **or** an Excel rubric (Sections/Criteria sheets)",
-    type=["json", "xlsx"],
-)
+if rubric_file:
+    try:
+        rubric = load_rubric_json(rubric_file) if rubric_file.name.endswith(".json") else load_rubric_excel(rubric_file)
+        st.success("Rubric loaded and validated ✅")
+        st.session_state["rubric"] = rubric
+        preview_rubric(rubric)
+    except Exception as e:
+        st.error(f"Failed to load rubric: {e}")
 
 # ----------------------------
 # Notebook execution (Step 2)
@@ -219,16 +132,19 @@ rubric_file = st.file_uploader(
 st.divider()
 st.subheader("Upload student submissions (.ipynb or .zip of many)")
 
-subs_file = st.file_uploader("Notebook or ZIP", type=["ipynb","zip"])
+subs_file = st.file_uploader("Notebook or ZIP", type=["ipynb", "zip"], key="subs")
+
+st.caption("Optional: upload shared data files and per-assignment requirements so relative paths & imports work:")
+data_zip_file = st.file_uploader("Data ZIP (e.g., Excel/CSV files students read relatively)", type=["zip"], key="datazip")
+reqs_file = st.file_uploader("requirements.txt (optional additions)", type=["txt"], key="reqs")
 
 if "executions" not in st.session_state:
-    st.session_state["executions"] = []  # list of dicts per student
+    st.session_state["executions"] = []  # list of dicts per executed notebook
 
 def _collect_ipynbs(upload) -> list[tuple[str, bytes]]:
-    """Return list of (name, bytes)."""
+    """Return list of (name, bytes) from a single .ipynb or a .zip containing many."""
     if upload.name.lower().endswith(".ipynb"):
         return [(upload.name, upload.getvalue())]
-    # zip
     out = []
     with zipfile.ZipFile(io.BytesIO(upload.getvalue())) as z:
         for name in z.namelist():
@@ -236,66 +152,70 @@ def _collect_ipynbs(upload) -> list[tuple[str, bytes]]:
                 out.append((name, z.read(name)))
     return out
 
-if subs_file and st.button("▶️ Run notebooks"):
+run_col1, run_col2 = st.columns([1, 4])
+with run_col1:
+    run_clicked = st.button("▶️ Run notebooks", type="primary", disabled=not subs_file)
+
+if run_clicked and subs_file:
     ipynbs = _collect_ipynbs(subs_file)
+    data_zip_bytes = data_zip_file.getvalue() if data_zip_file else None
+    req_bytes = reqs_file.getvalue() if reqs_file else None
+
     if not ipynbs:
-        st.warning("No .ipynb files found.")
+        st.warning("No .ipynb files found in the upload.")
     else:
         st.session_state["executions"].clear()
         progress = st.progress(0.0)
         for i, (name, data) in enumerate(ipynbs, start=1):
-            res = run_ipynb_bytes(data, timeout_per_cell=90)
+            res = run_ipynb_bytes(
+                data,
+                timeout_per_cell=90,
+                data_zip=data_zip_bytes,
+                extra_requirements_txt=req_bytes,
+            )
             spans = split_sections(res.executed_nb)
-            st.session_state["executions"].append({
-                "name": name,
-                "html": res.html,
-                "duration_s": res.duration_s,
-                "errors": res.errors,
-                "sections": spans,
-            })
-            progress.progress(i/len(ipynbs))
+            st.session_state["executions"].append(
+                {
+                    "name": name,
+                    "html": res.html,
+                    "duration_s": res.duration_s,
+                    "errors": res.errors,
+                    "sections": spans,
+                }
+            )
+            progress.progress(i / len(ipynbs))
         st.success(f"Executed {len(ipynbs)} notebook(s).")
 
 # Preview executions
 for info in st.session_state["executions"]:
     st.markdown(f"### 📄 {info['name']}")
-    cols = st.columns([1,2,2])
+    cols = st.columns([1, 2, 2])
     with cols[0]:
         st.caption(f"Ran in {info['duration_s']:.1f}s")
         if info["errors"]:
             st.error(f"Errors: {len(info['errors'])}")
+            with st.expander("Show error summaries"):
+                for e in info["errors"]:
+                    st.code(f"{e.get('ename')}: {e.get('evalue')}", language="text")
         else:
             st.success("No execution errors")
-        # list detected sections
         if info["sections"]:
             st.write("Detected sections:")
             st.code(", ".join(sorted(info["sections"].keys())), language="text")
         else:
             st.write("No Q-sections detected")
+
     with cols[1]:
         st.markdown("**Executed Notebook Preview**")
         st.components.v1.html(info["html"], height=450, scrolling=True)
+
     with cols[2]:
         st.markdown("**Raw section spans**")
         st.json(info["sections"])
 
-if rubric_file:
-    try:
-        if rubric_file.name.endswith(".json"):
-            rubric = load_rubric_json(rubric_file)
-        else:
-            rubric = load_rubric_excel(rubric_file)
-
-        st.success("Rubric loaded and validated ✅")
-        st.session_state["rubric"] = rubric
-        preview_rubric(rubric)
-    except Exception as e:
-        st.error(f"Failed to load rubric: {e}")
-
 st.divider()
 st.subheader("Next steps")
 st.markdown(
-    "- **Step 2:** Add notebook execution and Q1/Q2 section splitting.\n"
-    "- **Step 3:** Deterministic checks + optional LLM feedback.\n"
+    "- **Step 3:** Deterministic grading checks + optional LLM feedback (per-section).\n"
     "- **Step 4:** Gradescope-style review UI and student report export."
 )
