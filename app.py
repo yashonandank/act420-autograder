@@ -4,6 +4,9 @@ import time
 import pandas as pd
 import streamlit as st
 from jsonschema import validate, ValidationError
+import zipfile, io
+from src.notebook_exec import run_ipynb_bytes
+from src.segmentor import split_sections
 
 # ----------------------------
 # Page setup
@@ -209,6 +212,72 @@ rubric_file = st.file_uploader(
     "Upload `rubric.json` **or** an Excel rubric (Sections/Criteria sheets)",
     type=["json", "xlsx"],
 )
+
+# ----------------------------
+# Notebook execution (Step 2)
+# ----------------------------
+st.divider()
+st.subheader("Upload student submissions (.ipynb or .zip of many)")
+
+subs_file = st.file_uploader("Notebook or ZIP", type=["ipynb","zip"])
+
+if "executions" not in st.session_state:
+    st.session_state["executions"] = []  # list of dicts per student
+
+def _collect_ipynbs(upload) -> list[tuple[str, bytes]]:
+    """Return list of (name, bytes)."""
+    if upload.name.lower().endswith(".ipynb"):
+        return [(upload.name, upload.getvalue())]
+    # zip
+    out = []
+    with zipfile.ZipFile(io.BytesIO(upload.getvalue())) as z:
+        for name in z.namelist():
+            if name.lower().endswith(".ipynb") and not name.endswith("/"):
+                out.append((name, z.read(name)))
+    return out
+
+if subs_file and st.button("▶️ Run notebooks"):
+    ipynbs = _collect_ipynbs(subs_file)
+    if not ipynbs:
+        st.warning("No .ipynb files found.")
+    else:
+        st.session_state["executions"].clear()
+        progress = st.progress(0.0)
+        for i, (name, data) in enumerate(ipynbs, start=1):
+            res = run_ipynb_bytes(data, timeout_per_cell=90)
+            spans = split_sections(res.executed_nb)
+            st.session_state["executions"].append({
+                "name": name,
+                "html": res.html,
+                "duration_s": res.duration_s,
+                "errors": res.errors,
+                "sections": spans,
+            })
+            progress.progress(i/len(ipynbs))
+        st.success(f"Executed {len(ipynbs)} notebook(s).")
+
+# Preview executions
+for info in st.session_state["executions"]:
+    st.markdown(f"### 📄 {info['name']}")
+    cols = st.columns([1,2,2])
+    with cols[0]:
+        st.caption(f"Ran in {info['duration_s']:.1f}s")
+        if info["errors"]:
+            st.error(f"Errors: {len(info['errors'])}")
+        else:
+            st.success("No execution errors")
+        # list detected sections
+        if info["sections"]:
+            st.write("Detected sections:")
+            st.code(", ".join(sorted(info["sections"].keys())), language="text")
+        else:
+            st.write("No Q-sections detected")
+    with cols[1]:
+        st.markdown("**Executed Notebook Preview**")
+        st.components.v1.html(info["html"], height=450, scrolling=True)
+    with cols[2]:
+        st.markdown("**Raw section spans**")
+        st.json(info["sections"])
 
 if rubric_file:
     try:

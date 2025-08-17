@@ -3,3 +3,6 @@ pandas>=2.2
 openpyxl>=3.1
 jsonschema>=4.22
 bcrypt>=4.1
+nbformat>=5.9
+nbclient>=0.9
+nbconvert>=7.10
