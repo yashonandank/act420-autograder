@@ -1,0 +1,5 @@
+streamlit>=1.35
+pandas>=2.2
+openpyxl>=3.1
+jsonschema>=4.22
+bcrypt>=4.1
