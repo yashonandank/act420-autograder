@@ -170,13 +170,24 @@ if run_clicked and subs_file:
         st.session_state["executions"].clear()
         progress = st.progress(0.0)
         for i, (name, data) in enumerate(ipynbs, start=1):
-            res = run_ipynb_bytes(
-                data,
-                timeout_per_cell=90,
-                data_zip=data_zip_bytes,
-                extra_requirements_txt=req_bytes,
-                probes=probes,
-            )
+            try:
+                res = run_ipynb_bytes(
+                    data,
+                    timeout_per_cell=90,
+                    data_zip=data_zip_bytes,
+                    extra_requirements_txt=req_bytes,
+                    probes=probes,
+                )
+            except TypeError:
+                # older notebook_exec without probes support
+                res = run_ipynb_bytes(
+                    data,
+                    timeout_per_cell=90,
+                    data_zip=data_zip_bytes,
+                    extra_requirements_txt=req_bytes,
+                )
+                # synthesize empty probe results so downstream code doesn’t break
+                res.probe_results = {}
             spans = split_sections(res.executed_nb)
             st.session_state["executions"].append(
                 {
