@@ -70,7 +70,7 @@ logout_button()
 # Title
 # ----------------------------
 st.title("📊 Analytics Notebook Autograder")
-st.caption("Step 1–3: Login + rubric upload/validation + notebook execution & deterministic grading")
+st.caption("Run notebooks • Detect sections • Deterministic grading (LLM pass next)")
 
 # ----------------------------
 # Rubric upload/validate/preview
@@ -140,6 +140,17 @@ st.caption("Optional: upload shared data files and per-assignment requirements s
 data_zip_file = st.file_uploader("Data ZIP (e.g., Excel/CSV files students read relatively)", type=["zip"], key="datazip")
 reqs_file = st.file_uploader("requirements.txt (optional additions)", type=["txt"], key="reqs")
 
+# Execution options
+st.caption("Execution options")
+colA, colB, colC = st.columns([1, 1, 2])
+with colA:
+    cell_timeout = st.number_input("Cell timeout (sec)", min_value=30, max_value=600, value=120, step=10)
+with colB:
+    retry_timeout = st.checkbox("Auto-retry on timeout (2×)", value=True)
+with colC:
+    skip_tags_str = st.text_input("Skip cells with tags (comma-separated)", value="skip_autograde,long")
+skip_tags = [s.strip() for s in skip_tags_str.split(",") if s.strip()]
+
 if "executions" not in st.session_state:
     st.session_state["executions"] = []  # list of dicts per executed notebook
 
@@ -173,16 +184,18 @@ if run_clicked and subs_file:
             try:
                 res = run_ipynb_bytes(
                     data,
-                    timeout_per_cell=90,
+                    timeout_per_cell=int(cell_timeout),
                     data_zip=data_zip_bytes,
                     extra_requirements_txt=req_bytes,
                     probes=probes,
+                    retry_on_timeout=retry_timeout,
+                    skip_tags=skip_tags,
                 )
             except TypeError:
-                # older notebook_exec without probes support
+                # Older notebook_exec without probes/controls support
                 res = run_ipynb_bytes(
                     data,
-                    timeout_per_cell=90,
+                    timeout_per_cell=int(cell_timeout),
                     data_zip=data_zip_bytes,
                     extra_requirements_txt=req_bytes,
                 )
@@ -196,7 +209,7 @@ if run_clicked and subs_file:
                     "duration_s": res.duration_s,
                     "errors": res.errors,
                     "sections": spans,
-                    "probe_results": res.probe_results,
+                    "probe_results": getattr(res, "probe_results", {}),
                     # keep the executed notebook around in case we want artifact counts later
                     "executed_nb": res.executed_nb,
                 }
@@ -242,7 +255,7 @@ if grade_clicked:
     rubric = st.session_state.get("rubric")
     results = []
     for info in st.session_state["executions"]:
-        det = evaluate(rubric, info.get("probe_results", {}))
+        det = evaluate(rubric, info.get("probe_results", {}))  # (figure_exists via HTML can be added later)
         # attach feedback bullets per section
         for sec in det["sections"]:
             sec["feedback"] = feedback_from_scores(sec)

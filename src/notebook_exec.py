@@ -1,10 +1,12 @@
 # src/notebook_exec.py
-import os, io, time, sys, re, tempfile, zipfile, shutil, json, textwrap
+import os, io, time, sys, re, tempfile, zipfile, shutil, json
 import nbformat
 from nbclient import NotebookClient
 from nbconvert import HTMLExporter
 from jupyter_client.kernelspec import KernelSpecManager, NoSuchKernel
 from ipykernel.kernelspec import install as install_ipykernel_spec
+from nbclient.exceptions import CellTimeoutError
+
 from .package_manager import ensure_baseline, ensure_package
 
 class ExecResult:
@@ -27,7 +29,7 @@ def _ensure_kernel(kernel_name: str = "python3"):
 
 _MISSING_MOD_RE = re.compile(r"No module named '([^']+)'")
 
-def _append_probe_cell(nb: nbformat.NotebookNode, probes: dict[str, str]) -> nbformat.NotebookNode:
+def _append_probe_cell(nb: nbformat.NotebookNode, probes: dict) -> tuple[nbformat.NotebookNode, str]:
     """
     Append a cell that evaluates each probe expression safely and prints a JSON blob.
     `probes` is dict: {probe_id: python_expr}
@@ -95,12 +97,29 @@ def _extract_probe_json(executed_nb, marker: str) -> dict:
                     pass
     return payload
 
+def _strip_tagged_cells(nb, skip_tags: list[str] | None):
+    """Return a shallow-copied notebook without cells that have any of skip_tags."""
+    if not skip_tags:
+        return nb
+    skip = set(t.strip().lower() for t in skip_tags if t.strip())
+    new_nb = nbformat.from_dict(nb)
+    filtered = []
+    for c in new_nb.get("cells", []):
+        tags = set([t.lower() for t in c.get("metadata", {}).get("tags", [])])
+        if tags.intersection(skip):
+            continue
+        filtered.append(c)
+    new_nb["cells"] = filtered
+    return new_nb
+
 def run_ipynb_bytes(
     ipynb_bytes: bytes,
     timeout_per_cell: int = 90,
     data_zip: bytes | None = None,
     extra_requirements_txt: bytes | None = None,
-    probes: dict[str, str] | None = None,
+    probes: dict | None = None,
+    retry_on_timeout: bool = True,
+    skip_tags: list[str] | None = None,
 ) -> ExecResult:
     """
     Execute a notebook with:
@@ -108,14 +127,17 @@ def run_ipynb_bytes(
     - optional requirements.txt (pip install)
     - optional data.zip extracted to working dir (so relative file paths resolve)
     - optional `probes` dict of {probe_id: python_expr}; evaluated inside the kernel
-    - one retry if ModuleNotFoundError occurs (auto-install that module)
+    - optional skip_tags: drop cells tagged with any of these (e.g., ["skip_autograde","long"])
+    - one retry if CellTimeoutError occurs (2x timeout)
     """
     workdir = tempfile.mkdtemp(prefix="grader_run_")
     try:
+        # Make referenced files available (data ZIP)
         if data_zip:
             with zipfile.ZipFile(io.BytesIO(data_zip)) as z:
                 z.extractall(workdir)
 
+        # Optional requirements.txt (best-effort)
         if extra_requirements_txt:
             req_path = os.path.join(workdir, "requirements.txt")
             with open(req_path, "wb") as f:
@@ -126,21 +148,32 @@ def run_ipynb_bytes(
             except Exception:
                 pass
 
+        # Ensure a reasonable set of default libs
         ensure_baseline()
 
+        # Load base notebook + kernel
         base_nb = nbformat.reads(ipynb_bytes.decode("utf-8"), as_version=4)
         kernel_name = getattr(getattr(base_nb, "metadata", {}), "kernelspec", {}).get("name", None) or "python3"
         kernel_name = _ensure_kernel(kernel_name)
 
-        # append probe cell (if any)
+        # Build runnable copy with optional filtering and probes
         marker = None
-        nb_to_run = nbformat.from_dict(base_nb)
+        nb_to_run = _strip_tagged_cells(base_nb, skip_tags)
         if probes:
             nb_to_run, marker = _append_probe_cell(nb_to_run, probes)
 
-        executed, html, dur, errs = _run_once(nb_to_run, workdir, timeout_per_cell, kernel_name)
+        # First run
+        try:
+            executed, html, dur, errs = _run_once(nb_to_run, workdir, timeout_per_cell, kernel_name)
+        except CellTimeoutError:
+            if retry_on_timeout:
+                # Retry once with doubled per-cell timeout
+                executed, html, dur, errs = _run_once(nb_to_run, workdir, timeout_per_cell * 2, kernel_name)
+                errs = errs + [{"ename": "CellTimeoutError", "evalue": f"Retried with {timeout_per_cell*2}s per-cell timeout", "traceback": []}]
+            else:
+                raise
 
-        # retry if missing module
+        # Handle missing module (auto-install, then re-run once)
         missing = None
         for e in errs:
             if e.get("ename") == "ModuleNotFoundError" and e.get("evalue"):
@@ -148,11 +181,10 @@ def run_ipynb_bytes(
                 if m:
                     missing = m.group(1)
                     break
-
         if missing:
             try:
                 ensure_package(missing)
-                nb_to_run = nbformat.from_dict(base_nb)
+                nb_to_run = _strip_tagged_cells(base_nb, skip_tags)
                 if probes:
                     nb_to_run, marker = _append_probe_cell(nb_to_run, probes)
                 executed, html, dur, errs = _run_once(nb_to_run, workdir, timeout_per_cell, kernel_name)
