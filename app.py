@@ -9,6 +9,8 @@ import streamlit as st
 from src.segmentor import split_sections
 from src.notebook_exec import run_ipynb_bytes
 from src.rubric_schema import load_rubric_json, load_rubric_excel
+from src.grader import build_probes_from_rubric, evaluate
+from src.feedback_generator import feedback_from_scores
 
 # ----------------------------
 # Page setup
@@ -68,7 +70,7 @@ logout_button()
 # Title
 # ----------------------------
 st.title("📊 Analytics Notebook Autograder")
-st.caption("Step 1–2: Login + rubric upload/validation + notebook execution & section detection")
+st.caption("Step 1–3: Login + rubric upload/validation + notebook execution & deterministic grading")
 
 # ----------------------------
 # Rubric upload/validate/preview
@@ -127,7 +129,7 @@ if rubric_file:
         st.error(f"Failed to load rubric: {e}")
 
 # ----------------------------
-# Notebook execution (Step 2)
+# Notebook execution
 # ----------------------------
 st.divider()
 st.subheader("Upload student submissions (.ipynb or .zip of many)")
@@ -141,7 +143,7 @@ reqs_file = st.file_uploader("requirements.txt (optional additions)", type=["txt
 if "executions" not in st.session_state:
     st.session_state["executions"] = []  # list of dicts per executed notebook
 
-def _collect_ipynbs(upload) -> list[tuple[str, bytes]]:
+def _collect_ipynbs(upload):
     """Return list of (name, bytes) from a single .ipynb or a .zip containing many."""
     if upload.name.lower().endswith(".ipynb"):
         return [(upload.name, upload.getvalue())]
@@ -160,6 +162,7 @@ if run_clicked and subs_file:
     ipynbs = _collect_ipynbs(subs_file)
     data_zip_bytes = data_zip_file.getvalue() if data_zip_file else None
     req_bytes = reqs_file.getvalue() if reqs_file else None
+    probes = build_probes_from_rubric(st.session_state.get("rubric")) if st.session_state.get("rubric") else {}
 
     if not ipynbs:
         st.warning("No .ipynb files found in the upload.")
@@ -172,6 +175,7 @@ if run_clicked and subs_file:
                 timeout_per_cell=90,
                 data_zip=data_zip_bytes,
                 extra_requirements_txt=req_bytes,
+                probes=probes,
             )
             spans = split_sections(res.executed_nb)
             st.session_state["executions"].append(
@@ -181,41 +185,86 @@ if run_clicked and subs_file:
                     "duration_s": res.duration_s,
                     "errors": res.errors,
                     "sections": spans,
+                    "probe_results": res.probe_results,
+                    # keep the executed notebook around in case we want artifact counts later
+                    "executed_nb": res.executed_nb,
                 }
             )
             progress.progress(i / len(ipynbs))
         st.success(f"Executed {len(ipynbs)} notebook(s).")
 
-# Preview executions
+# ---- Preview executions (basic, clean) ----
 for info in st.session_state["executions"]:
     st.markdown(f"### 📄 {info['name']}")
     cols = st.columns([1, 2, 2])
     with cols[0]:
-        st.caption(f"Ran in {info['duration_s']:.1f}s")
+        st.caption(f"⏱ Ran in {info['duration_s']:.1f}s")
         if info["errors"]:
-            st.error(f"Errors: {len(info['errors'])}")
+            st.error(f"⚠️ {len(info['errors'])} execution errors")
             with st.expander("Show error summaries"):
                 for e in info["errors"]:
                     st.code(f"{e.get('ename')}: {e.get('evalue')}", language="text")
         else:
-            st.success("No execution errors")
+            st.success("✅ No execution errors")
         if info["sections"]:
             st.write("Detected sections:")
             st.code(", ".join(sorted(info["sections"].keys())), language="text")
         else:
             st.write("No Q-sections detected")
-
     with cols[1]:
         st.markdown("**Executed Notebook Preview**")
-        st.components.v1.html(info["html"], height=450, scrolling=True)
-
+        st.components.v1.html(info["html"], height=500, scrolling=True)
     with cols[2]:
         st.markdown("**Raw section spans**")
         st.json(info["sections"])
 
+# ----------------------------
+# Deterministic grading
+# ----------------------------
+st.divider()
+st.subheader("Grading (deterministic checks)")
+
+grade_disabled = not st.session_state.get("rubric") or not st.session_state.get("executions")
+grade_clicked = st.button("🧮 Grade all (deterministic)", disabled=grade_disabled, type="primary")
+
+if grade_clicked:
+    rubric = st.session_state.get("rubric")
+    results = []
+    for info in st.session_state["executions"]:
+        det = evaluate(rubric, info.get("probe_results", {}))
+        # attach feedback bullets per section
+        for sec in det["sections"]:
+            sec["feedback"] = feedback_from_scores(sec)
+        results.append({"name": info["name"], "deterministic": det})
+    st.session_state["grading_results"] = results
+    st.success("Grading complete.")
+
+# ---- Results viewer ----
+if st.session_state.get("grading_results"):
+    for r in st.session_state["grading_results"]:
+        st.markdown(f"### 🧾 {r['name']}")
+        det = r["deterministic"]
+        st.caption(f"Total: **{det['total']['earned']:.2f} / {det['total']['max']:.2f}**")
+        for sec in det["sections"]:
+            with st.expander(f"{sec['id']} — {sec['earned']:.2f} / {sec['max']:.2f}", expanded=False):
+                st.markdown("**Criteria**")
+                st.dataframe(
+                    [{
+                        "criterion_id": row["id"],
+                        "score": row["score"],
+                        "max": row["max"],
+                        "why": row["justification"],
+                    } for row in sec["rows"]],
+                    hide_index=True, use_container_width=True
+                )
+                st.markdown("**Feedback**")
+                for b in sec.get("feedback", []):
+                    st.write("- " + b)
+
 st.divider()
 st.subheader("Next steps")
 st.markdown(
-    "- **Step 3:** Deterministic grading checks + optional LLM feedback (per-section).\n"
-    "- **Step 4:** Gradescope-style review UI and student report export."
+    "- **LLM grading pass** (compare vs deterministic and flag mismatches).\n"
+    "- **Editable scores & comments** before finalizing.\n"
+    "- **Student report export** (HTML/PDF) and CSV of grades."
 )
