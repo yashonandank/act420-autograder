@@ -14,26 +14,27 @@ from src.rubric_schema import load_rubric_json, load_rubric_excel
 from src.segmentor import split_sections
 from src.notebook_exec import run_ipynb_bytes
 
-# ----------------------------
-# Page, session, and login
-# ----------------------------
+# =========================
+# Page & Auth
+# =========================
 st.set_page_config(layout="wide", page_title="Analytics Autograder")
 
 SESSION_KEY = "auth"
 SESSION_TTL = 60 * 60  # 60 minutes
 
-def _require_login():
+def require_login():
     auth = st.session_state.get(SESSION_KEY)
     now = time.time()
     if auth and (now - auth["ts"] < SESSION_TTL):
         st.session_state[SESSION_KEY]["ts"] = now
-        return True
-
+        return
     st.title("🔐 Login")
     users = st.secrets.get("users", {})
+    if not users:
+        st.warning("No users configured. Add a [users] block in Streamlit Secrets.")
     with st.form("login"):
-        u = st.text_input("Username", value="")
-        p = st.text_input("Password", type="password", value="")
+        u = st.text_input("Username")
+        p = st.text_input("Password", type="password")
         ok = st.form_submit_button("Sign in")
     if ok and u in users and p == str(users[u]):
         st.session_state[SESSION_KEY] = {"user": u, "ts": time.time()}
@@ -41,7 +42,7 @@ def _require_login():
         st.rerun()
     st.stop()
 
-_require_login()
+require_login()
 with st.sidebar:
     st.caption("Session")
     if st.button("Log out"):
@@ -50,28 +51,30 @@ with st.sidebar:
 
 st.title("📊 Analytics Notebook Autograder")
 
-# ----------------------------
-# Shared state helpers
-# ----------------------------
+# Clear old cached list structure once (migrated to dict)
+if isinstance(st.session_state.get("llm_results"), list):
+    st.session_state.pop("llm_results")
+
+# =========================
+# Session state helpers
+# =========================
 def ss_get(key, default):
     if key not in st.session_state:
         st.session_state[key] = default
     return st.session_state[key]
 
-# central stores
 rubric: Dict[str, Any] = ss_get("rubric", {})
-files_buf: Dict[str, bytes] = ss_get("files_buf", {})        # filename -> bytes
-roster_df: pd.DataFrame | None = ss_get("roster_df", None)   # optional mapping
+files_buf: Dict[str, bytes] = ss_get("files_buf", {})
+roster_df: pd.DataFrame | None = ss_get("roster_df", None)
 mapping_df: pd.DataFrame = ss_get("mapping_df", pd.DataFrame(columns=["filename","student_id","student_name"]))
 executions: Dict[str, Dict[str, Any]] = ss_get("executions", {})  # student_id -> exec info
 llm_results: Dict[str, Dict[str, Any]] = ss_get("llm_results", {})# student_id -> graded
-overrides: Dict[str, float] = ss_get("overrides", {})             # f"{student_id}::{section_id}" -> score
+overrides: Dict[str, float] = ss_get("overrides", {})             # f"{sid}::{Qid}" -> score
 
-# ----------------------------
+# =========================
 # Utilities
-# ----------------------------
+# =========================
 _FILENAME_STUDENT_PATTERNS = [
-    # Try common LMS exports:
     r"^(?P<last>[^,_-]+),\s*(?P<first>[^_-]+)\s*-\s*(?P<id>[A-Za-z0-9._-]+).*\.ipynb$",
     r"^(?P<id>\d+)[-_].*\.ipynb$",
     r"^(?P<first>[A-Za-z]+)[-_](?P<last>[A-Za-z]+)[-_](?P<id>[A-Za-z0-9]+).*\.ipynb$",
@@ -79,25 +82,22 @@ _FILENAME_STUDENT_PATTERNS = [
 ]
 
 def guess_student_from_filename(name: str) -> Tuple[str,str]:
-    """Return (student_id, student_name) best-effort from filename."""
     for pat in _FILENAME_STUDENT_PATTERNS:
         m = re.match(pat, name, flags=re.IGNORECASE)
         if m:
             gid = (m.groupdict().get("id") or "").strip()
             first = (m.groupdict().get("first") or "").strip().title()
             last  = (m.groupdict().get("last") or "").strip().title()
-            sname = " ".join(x for x in [first, last] if x).strip()
-            if not sname:
-                sname = gid
-            if not gid:
-                gid = sname
+            sname = " ".join(x for x in [first, last] if x).strip() or gid
+            gid = gid or sname
             return (gid, sname)
     base = name.rsplit("/",1)[-1]
-    return (base.replace(".ipynb",""), base.replace(".ipynb",""))
+    base = base.replace(".ipynb","")
+    return (base, base)
 
 def collect_ipynbs(upload) -> List[tuple[str, bytes]]:
     if upload.name.lower().endswith(".ipynb"):
-        return [(upload.name, upload.getvalue())]
+        return [(upload.name.split("/")[-1], upload.getvalue())]
     out = []
     with zipfile.ZipFile(io.BytesIO(upload.getvalue())) as z:
         for nm in z.namelist():
@@ -112,17 +112,17 @@ def ensure_openai_client():
     from openai import OpenAI
     return OpenAI(api_key=st.secrets["openai"]["api_key"]), st.secrets["openai"].get("model","gpt-4o-mini")
 
-# ----------------------------
+# =========================
 # Tabs
-# ----------------------------
+# =========================
 tab_rubric, tab_subs, tab_run, tab_grade, tab_reports, tab_analytics = st.tabs(
     ["📋 Rubric", "📥 Submissions", "⚙️ Run", "🧠 Grade", "📄 Reports", "📈 Analytics"]
 )
 
-# --------- Rubric tab ----------
+# ---------- Rubric ----------
 with tab_rubric:
     st.subheader("Upload / Edit Rubric")
-    st.caption("Upload Excel (Sections & Criteria sheets) or JSON.")
+    st.caption("Upload Excel (sheets: Sections, Criteria) or JSON.")
     up = st.file_uploader("Rubric file", type=["xlsx","json"], key="rubric_file")
     if up:
         try:
@@ -141,22 +141,18 @@ with tab_rubric:
             total = sum(s.get("points",0) or sum(c.get("max",0) for c in s.get("criteria",[])) for s in rubric["sections"])
             st.metric("Total Points", total)
 
-        # lightweight in-app edit: rename titles and point caps
-        editable = []
-        for s in rubric["sections"]:
-            editable.append({
-                "section_id": s["id"],
-                "title": s.get("title",""),
-                "points": float(s.get("points",0) or 0.0),
-                "criteria_count": len(s.get("criteria",[]))
-            })
+        editable = [{
+            "section_id": s["id"],
+            "title": s.get("title",""),
+            "points": float(s.get("points",0) or 0.0),
+            "criteria_count": len(s.get("criteria",[]))
+        } for s in rubric["sections"]]
         edf = st.data_editor(pd.DataFrame(editable), hide_index=True, key="rubric_editor")
-        if st.button("Apply changes to rubric titles/points"):
-            # merge back
+        if st.button("Apply changes to titles/points"):
             by_id = {row["section_id"]: row for _, row in edf.iterrows()}
             for s in rubric["sections"]:
                 if s["id"] in by_id:
-                    s["title"] = by_id[s["id"]]["title"]
+                    s["title"]  = by_id[s["id"]]["title"]
                     s["points"] = float(by_id[s["id"]]["points"])
             st.success("Applied edits.")
 
@@ -167,17 +163,17 @@ with tab_rubric:
             mime="application/json"
         )
 
-# --------- Submissions tab ----------
+# ---------- Submissions ----------
 with tab_subs:
-    st.subheader("Upload student notebooks (single or zip)")
+    st.subheader("Upload student notebooks")
     up_nb = st.file_uploader("Notebook or ZIP", type=["ipynb","zip"], key="subs_file")
     if up_nb:
         pairs = collect_ipynbs(up_nb)
-        # store in files_buf
         for nm, b in pairs:
             files_buf[nm] = b
         st.success(f"Loaded {len(pairs)} notebook(s).")
-    st.caption("Optional: roster CSV with columns `student_id, student_name` for mapping/validation.")
+
+    st.caption("Optional roster CSV with columns: student_id, student_name")
     up_roster = st.file_uploader("Roster CSV", type=["csv"], key="roster_csv")
     if up_roster:
         try:
@@ -185,20 +181,18 @@ with tab_subs:
             assert {"student_id","student_name"}.issubset(df.columns)
             st.session_state["roster_df"] = df.copy()
             roster_df = df
-            st.success(f"Roster loaded ({len(df)} students).")
+            st.success(f"Roster loaded ({len(df)}).")
         except Exception as e:
             st.error(f"Roster parse failed: {e}")
 
-    # Build/refresh mapping table
     if files_buf:
         rows = []
         for fn in sorted(files_buf.keys()):
             sid, sname = guess_student_from_filename(fn)
             rows.append({"filename": fn, "student_id": sid, "student_name": sname})
         mdf = pd.DataFrame(rows)
-        # If roster provided, try to align names/ids
+
         if roster_df is not None:
-            # basic left join by student_id if it looks present
             merged = mdf.merge(roster_df, on="student_id", how="left", suffixes=("","_roster"))
             merged["student_name"] = merged["student_name_roster"].fillna(merged["student_name"])
             merged = merged.drop(columns=[c for c in merged.columns if c.endswith("_roster")])
@@ -208,16 +202,17 @@ with tab_subs:
         mapping_df = st.data_editor(mdf, num_rows="dynamic", use_container_width=True, key="map_editor")
         st.session_state["mapping_df"] = mapping_df
 
-        # quick validation
         dup_ids = mapping_df["student_id"][mapping_df["student_id"].duplicated(keep=False)]
         if len(dup_ids) > 0:
-            st.warning(f"Duplicate student_id values found: {sorted(set(dup_ids))}. You can still proceed, but reports/CSV will merge by the last run.")
+            st.warning(f"Duplicate student_id values: {sorted(set(dup_ids))}")
 
-# --------- Run tab ----------
+# ---------- Run ----------
 with tab_run:
     st.subheader("Execute notebooks")
-    if not mapping_df.empty:
-        st.caption("Optional: assignment data & requirements for imports/relative paths.")
+    if mapping_df.empty:
+        st.info("Upload submissions and build the mapping in the **Submissions** tab.")
+    else:
+        st.caption("Optional: data.zip & requirements.txt used by the assignment.")
         data_zip_file = st.file_uploader("Data ZIP", type=["zip"], key="datazip")
         reqs_file = st.file_uploader("requirements.txt", type=["txt"], key="reqs")
 
@@ -227,7 +222,7 @@ with tab_run:
         with colB:
             retry_timeout = st.checkbox("Auto-retry on timeout", value=True)
         with colC:
-            skip_tags_str = st.text_input("Skip cells with tags (comma-separated)", value="skip_autograde,long")
+            skip_tags_str = st.text_input("Skip cells with tags", value="skip_autograde,long")
         skip_tags = [s.strip() for s in skip_tags_str.split(",") if s.strip()]
 
         if st.button("▶️ Run all mapped notebooks", type="primary"):
@@ -252,6 +247,7 @@ with tab_run:
                         skip_tags=skip_tags,
                     )
                 except TypeError:
+                    # older executor fallback
                     res = run_ipynb_bytes(raw, timeout_per_cell=int(cell_timeout))
                     res.probe_results = {}
 
@@ -269,17 +265,14 @@ with tab_run:
                 progress.progress(i/len(items))
             st.success(f"Executed {len(executions)} notebook(s).")
 
-    # quick preview
     if executions:
-        sid = st.selectbox("Preview student", options=list(executions.keys()), format_func=lambda k: f"{executions[k]['student_name']} ({k})")
+        sid = st.selectbox("Preview student", options=list(executions.keys()),
+                           format_func=lambda k: f"{executions[k]['student_name']} ({k})")
         info = executions[sid]
         cols = st.columns([1,2,2])
         with cols[0]:
             st.caption(f"⏱ {info['duration_s']:.1f}s")
-            if info["errors"]:
-                st.error(f"{len(info['errors'])} error(s)")
-            else:
-                st.success("No execution errors")
+            st.success("No execution errors") if not info["errors"] else st.error(f"{len(info['errors'])} error(s)")
             st.write("Sections detected:")
             st.code(", ".join(info["sections"].get("_order", [])) or "—", language="text")
         with cols[1]:
@@ -289,7 +282,7 @@ with tab_run:
             st.markdown("**Raw section spans**")
             st.json(info["sections"])
 
-# --------- Grade tab ----------
+# ---------- Grade ----------
 with tab_grade:
     st.subheader("LLM grading per section")
     if not rubric:
@@ -322,8 +315,9 @@ with tab_grade:
                     per_sections.append(graded)
                 total_max = sum(s["total_points"] for s in per_sections)
                 total_earned = sum(s["earned_points"] for s in per_sections)
-                llm_results[info["student_id"]] = {
-                    "student_id": info["student_id"],
+                sid = info["student_id"]
+                llm_results[sid] = {
+                    "student_id": sid,
                     "student_name": info["student_name"],
                     "filename": info["filename"],
                     "sections": per_sections,
@@ -332,7 +326,6 @@ with tab_grade:
                 progress.progress(i/len(students))
             st.success(f"Graded {len(llm_results)} student(s).")
 
-        # viewer + edits
         if llm_results:
             sid = st.selectbox("Review student", options=list(llm_results.keys()),
                                format_func=lambda k: f"{llm_results[k]['student_name']} ({k})", key="grade_review_sid")
@@ -368,13 +361,12 @@ with tab_grade:
                 f"Total (with overrides): **{tot_override:.2f} / {res['total']['max']:.2f}**"
             )
 
-# --------- Reports tab ----------
+# ---------- Reports ----------
 with tab_reports:
     st.subheader("Per-student reports & class CSV")
     if not llm_results:
         st.info("Grade students in the **Grade** tab first.")
     else:
-        # Build data for CSV and enable per-student HTML download
         rows = []
         for sid, res in llm_results.items():
             total_override = 0.0
@@ -391,7 +383,6 @@ with tab_reports:
             })
         csv_df = pd.DataFrame(rows).sort_values(["student_name","student_id"])
         st.dataframe(csv_df, use_container_width=True, hide_index=True)
-
         st.download_button(
             "⬇️ Download class scores (CSV)",
             data=csv_df.to_csv(index=False).encode("utf-8"),
@@ -403,7 +394,6 @@ with tab_reports:
         sid = st.selectbox("Generate report for student", options=list(llm_results.keys()),
                            format_func=lambda k: f"{llm_results[k]['student_name']} ({k})", key="report_sid")
         res = llm_results[sid]
-        # assemble simple HTML
         html_parts = [
             f"<h2>Report — {res['student_name']} ({sid})</h2>",
             f"<p><b>File:</b> {res['filename']}</p>",
@@ -432,7 +422,7 @@ with tab_reports:
             mime="text/html"
         )
 
-# --------- Analytics tab ----------
+# ---------- Analytics ----------
 with tab_analytics:
     st.subheader("Class-wide analytics")
     if not llm_results:
@@ -453,7 +443,6 @@ with tab_analytics:
         df = pd.DataFrame(rows)
         st.dataframe(df, use_container_width=True, hide_index=True)
 
-        # quick aggregates
         agg = df.groupby("section_id").agg(
             n=("score","count"),
             mean=("score","mean"),
@@ -462,7 +451,5 @@ with tab_analytics:
         agg["pct_mean"] = (agg["mean"] / agg["max"]) * 100.0
         st.markdown("#### Section summary")
         st.dataframe(agg, use_container_width=True, hide_index=True)
-
-        # streamlit’s built-in charts for quick viz
         st.markdown("#### Mean % by section")
         st.bar_chart(agg.set_index("section_id")["pct_mean"])
