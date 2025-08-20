@@ -1,72 +1,84 @@
+# src/rubric_schema.py
 import json
-from jsonschema import validate, ValidationError
 import pandas as pd
 
-RUBRIC_SCHEMA = {
-  "type":"object","required":["sections"],
-  "properties":{
-    "sections":{
-      "type":"array",
-      "items":{
-        "type":"object","required":["id","points","criteria"],
-        "properties":{
-          "id":{"type":"string","pattern":"^Q\\d+$"},
-          "title":{"type":"string"},
-          "points":{"type":"number","minimum":0},
-          "criteria":{"type":"array","items":{
-            "type":"object","required":["id","type","max"],
-            "properties":{
-              "id":{"type":"string"},
-              "criterion":{"type":"string"},
-              "type":{"enum":["columns","row_count","stat_range","unique_count","null_rate","table_shape","figure_exists","llm_feedback"]},
-              "args":{"type":"object"},
-              "max":{"type":"number","minimum":0},
-              "auto_only":{"type":["boolean","null"]},
-              "bonus_cap":{"type":["number","null"]}
-            }}}}}}}}
+# Legacy deterministic types still accepted (you may ignore them in LLM-only mode)
+_ALLOWED_TYPES = {
+    "columns","row_count","stat_range","unique_count",
+    "null_rate","table_shape","figure_exists",
+    "llm_feedback","llm_grade"
+}
 
-def load_rubric_json(file_obj):
-    data = json.load(file_obj)
-    validate(instance=data, schema=RUBRIC_SCHEMA)
+_ALIASES_TO_LLM_GRADE = {"llm_grader","llm","llmgrade","freeform","feedback"}
+
+def _normalize_type(t: str) -> str:
+    if not t:
+        return "llm_grade"
+    t = str(t).strip().lower()
+    if t in _ALIASES_TO_LLM_GRADE:
+        return "llm_grade"
+    if t == "llm_feedback":
+        # unify to llm_grade so downstream only handles one
+        return "llm_grade"
+    return t
+
+def _normalize_inplace(rubric: dict):
+    for s in rubric.get("sections", []):
+        for c in s.get("criteria", []):
+            c["type"] = _normalize_type(c.get("type",""))
+
+def _validate(rubric: dict):
+    assert "sections" in rubric and isinstance(rubric["sections"], list), "Rubric missing `sections`"
+    for s in rubric["sections"]:
+        assert "id" in s and "criteria" in s, f"Section invalid: {s}"
+        for c in s["criteria"]:
+            ctype = c.get("type","")
+            if ctype not in _ALLOWED_TYPES:
+                raise ValueError(
+                    f"Criterion type '{ctype}' not supported. Allowed: {sorted(_ALLOWED_TYPES)}"
+                )
+
+def load_rubric_json(file) -> dict:
+    data = json.load(file)
+    _normalize_inplace(data)
+    _validate(data)
     return data
 
-def load_rubric_excel(file_obj):
-    x = pd.ExcelFile(file_obj)
-    sections = pd.read_excel(x, "Sections").fillna("")
-    criteria = pd.read_excel(x, "Criteria").fillna("")
-    sections["section_id"] = sections["section_id"].astype(str).str.strip()
-    criteria["section_id"] = criteria["section_id"].astype(str).str.strip()
-
+def load_rubric_excel(file) -> dict:
+    xls = pd.ExcelFile(file)
+    sections = pd.read_excel(xls, "Sections")
+    criteria = pd.read_excel(xls, "Criteria")
     out = {"sections": []}
-    if "order" in sections.columns:
-        sections = sections.sort_values("order")
+    by_sec = criteria.groupby("section_id")
 
-    for _, s in sections.iterrows():
-        sec_id = str(s["section_id"])
-        pts = float(s.get("points", 0) or 0)
-        title = str(s.get("title",""))
-        subset = criteria[criteria["section_id"] == sec_id]
-        rows = []
-        for _, c in subset.iterrows():
-            args = {}
-            sargs = str(c.get("args_json","")).strip()
-            if sargs:
-                try:
-                    args = json.loads(sargs)
-                except Exception as e:
-                    raise ValidationError(
-                        f"Invalid args_json for criterion_id={c.get('criterion_id')}: {e}"
-                    )
-            rows.append({
-                "id": str(c.get("criterion_id")),
-                "criterion": str(c.get("label","")),
-                "type": str(c.get("type")),
-                "args": args,
-                "max": float(c.get("max_points",0) or 0),
-                "auto_only": bool(c.get("auto_only")) if str(c.get("auto_only","")).strip() != "" else None,
-                "bonus_cap": float(c.get("bonus_cap",0)) if str(c.get("bonus_cap","")).strip() != "" else None
-            })
-        out["sections"].append({"id": sec_id, "title": title, "points": pts, "criteria": rows})
+    for _, srow in sections.sort_values("order").iterrows():
+        sid = str(srow["section_id"])
+        sec = {
+            "id": sid,
+            "title": srow.get("title",""),
+            "points": float(srow.get("points", 0) or 0),
+            "criteria": []
+        }
+        if sid in by_sec.groups:
+            for _, crow in by_sec.get_group(sid).iterrows():
+                # parse args_json (optional)
+                args = {}
+                raw = crow.get("args_json", "")
+                if isinstance(raw, str) and raw.strip():
+                    try:
+                        args = json.loads(raw)
+                    except Exception:
+                        args = {}
+                ctype = _normalize_type(crow.get("type",""))
+                sec["criteria"].append({
+                    "id": str(crow["criterion_id"]),
+                    "criterion": crow.get("label",""),
+                    "type": ctype,
+                    "args": args,
+                    "max": float(crow.get("max_points", 0) or 0),
+                })
+        out["sections"].append(sec)
 
-    validate(instance=out, schema=RUBRIC_SCHEMA)
+    _normalize_inplace(out)
+    _validate(out)
     return out
