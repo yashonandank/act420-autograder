@@ -3,23 +3,21 @@ import io
 import json
 import time
 import zipfile
+from typing import Dict, Any, List
+
 import pandas as pd
 import streamlit as st
 
 from src.segmentor import split_sections
 from src.notebook_exec import run_ipynb_bytes
 from src.rubric_schema import load_rubric_json, load_rubric_excel
-from src.grader import build_probes_from_rubric, evaluate
-from src.feedback_generator import feedback_from_scores
+from src.llm_grader import build_section_context, grade_section_llm
 
 # ----------------------------
-# Page setup
+# Page & Session
 # ----------------------------
 st.set_page_config(layout="wide", page_title="Analytics Autograder")
 
-# ----------------------------
-# Simple login (plain secrets)
-# ----------------------------
 SESSION_KEY = "auth"
 SESSION_TTL = 60 * 60  # 60 minutes
 
@@ -28,8 +26,7 @@ def check_login() -> bool:
     auth = st.session_state.get(SESSION_KEY)
     now = time.time()
     if auth and (now - auth["ts"] < SESSION_TTL):
-        # refresh TTL
-        st.session_state[SESSION_KEY]["ts"] = now
+        st.session_state[SESSION_KEY]["ts"] = now  # refresh TTL
         return True
 
     st.title("🔐 Login")
@@ -38,7 +35,7 @@ def check_login() -> bool:
     if not users:
         st.warning(
             "No users found in Secrets. Add a [users] block in "
-            "`.streamlit/secrets.toml` (local) or in the Streamlit Cloud Secrets UI."
+            "`.streamlit/secrets.toml` (local) or the Streamlit Cloud Secrets UI."
         )
 
     with st.form("login"):
@@ -62,43 +59,43 @@ def logout_button():
             st.session_state.pop(SESSION_KEY, None)
             st.rerun()
 
-# Require login
 check_login()
 logout_button()
 
 # ----------------------------
-# Title
+# Header
 # ----------------------------
 st.title("📊 Analytics Notebook Autograder")
-st.caption("Run notebooks • Detect sections • Deterministic grading (LLM pass next)")
+st.caption("Run notebooks • Detect Q-sections • LLM grading & feedback per section")
 
 # ----------------------------
-# Rubric upload/validate/preview
+# Rubric upload/preview
 # ----------------------------
-with st.expander("➡️ Excel rubric template format"):
+with st.expander("➡️ Rubric format (Excel or JSON)"):
     st.write(
-        "- **Sections** sheet: `section_id`, `title`, `points`, `order`\n"
-        "- **Criteria** sheet: `section_id`, `criterion_id`, `label`, `type`, `args_json`, `max_points`, `auto_only`, `bonus_cap`\n"
-        "- Allowed `type`: `columns`, `row_count`, `stat_range`, `unique_count`, `null_rate`, `table_shape`, `figure_exists`, `llm_feedback`"
+        "- **Excel** requires two sheets:\n"
+        "  - `Sections`: `section_id`, `title`, `points`, `order`\n"
+        "  - `Criteria`: `section_id`, `criterion_id`, `label`, `type` (`llm_grade`), "
+        "`args_json` (optional), `max_points`, `auto_only` (ignored), `bonus_cap` (ignored)\n"
+        "- **JSON**: `{'sections': [{'id','title','points','criteria':[{'id','criterion','type','args','max'}]}]}`\n"
+        "- We ignore non-`llm_grade` types (treated as `llm_grade`)."
     )
 
 st.subheader("Upload Rubric")
 rubric_file = st.file_uploader(
-    "Upload `rubric.json` **or** an Excel rubric (must include the sheets above)",
-    type=["json", "xlsx"],
+    "Upload rubric.xlsx or rubric.json",
+    type=["xlsx", "json"],
     key="rubric_uploader"
 )
 
-def preview_rubric(rubric: dict):
-    # Top summary
+def preview_rubric(rubric: Dict[str, Any]):
     cols = st.columns([1, 2, 1])
     with cols[0]:
         st.metric("Sections", len(rubric["sections"]))
     with cols[2]:
-        total = sum(s.get("points", 0) for s in rubric["sections"])
+        total = sum(s.get("points", 0) or sum(c.get("max", 0) for c in s.get("criteria", [])) for s in rubric["sections"])
         st.metric("Total Points", total)
 
-    # Per-section table
     for s in rubric["sections"]:
         with st.container(border=True):
             st.markdown(f"**{s['id']}** — {s.get('title','')}")
@@ -111,10 +108,8 @@ def preview_rubric(rubric: dict):
                         "type": r.get("type"),
                         "max": r.get("max"),
                         "args": json.dumps(r.get("args", {})),
-                        "auto_only": r.get("auto_only"),
-                        "bonus_cap": r.get("bonus_cap"),
                     }
-                    for r in s["criteria"]
+                    for r in s.get("criteria", [])
                 ]
             )
             st.dataframe(df, use_container_width=True, hide_index=True)
@@ -122,8 +117,8 @@ def preview_rubric(rubric: dict):
 if rubric_file:
     try:
         rubric = load_rubric_json(rubric_file) if rubric_file.name.endswith(".json") else load_rubric_excel(rubric_file)
-        st.success("Rubric loaded and validated ✅")
         st.session_state["rubric"] = rubric
+        st.success("Rubric loaded ✅")
         preview_rubric(rubric)
     except Exception as e:
         st.error(f"Failed to load rubric: {e}")
@@ -132,13 +127,13 @@ if rubric_file:
 # Notebook execution
 # ----------------------------
 st.divider()
-st.subheader("Upload student submissions (.ipynb or .zip of many)")
+st.subheader("Upload student submissions")
 
-subs_file = st.file_uploader("Notebook or ZIP", type=["ipynb", "zip"], key="subs")
+subs_file = st.file_uploader("Notebook (.ipynb) or ZIP of notebooks", type=["ipynb", "zip"], key="subs")
 
-st.caption("Optional: upload shared data files and per-assignment requirements so relative paths & imports work:")
-data_zip_file = st.file_uploader("Data ZIP (e.g., Excel/CSV files students read relatively)", type=["zip"], key="datazip")
-reqs_file = st.file_uploader("requirements.txt (optional additions)", type=["txt"], key="reqs")
+st.caption("Optional: provide shared data & extra requirements (for imports) so students' relative paths work:")
+data_zip_file = st.file_uploader("Data ZIP (CSV/Excel/etc.)", type=["zip"], key="datazip")
+reqs_file = st.file_uploader("requirements.txt (optional)", type=["txt"], key="reqs")
 
 # Execution options
 st.caption("Execution options")
@@ -154,8 +149,7 @@ skip_tags = [s.strip() for s in skip_tags_str.split(",") if s.strip()]
 if "executions" not in st.session_state:
     st.session_state["executions"] = []  # list of dicts per executed notebook
 
-def _collect_ipynbs(upload):
-    """Return list of (name, bytes) from a single .ipynb or a .zip containing many."""
+def _collect_ipynbs(upload) -> List[tuple[str, bytes]]:
     if upload.name.lower().endswith(".ipynb"):
         return [(upload.name, upload.getvalue())]
     out = []
@@ -165,7 +159,7 @@ def _collect_ipynbs(upload):
                 out.append((name, z.read(name)))
     return out
 
-run_col1, run_col2 = st.columns([1, 4])
+run_col1, _ = st.columns([1, 4])
 with run_col1:
     run_clicked = st.button("▶️ Run notebooks", type="primary", disabled=not subs_file)
 
@@ -173,7 +167,6 @@ if run_clicked and subs_file:
     ipynbs = _collect_ipynbs(subs_file)
     data_zip_bytes = data_zip_file.getvalue() if data_zip_file else None
     req_bytes = reqs_file.getvalue() if reqs_file else None
-    probes = build_probes_from_rubric(st.session_state.get("rubric")) if st.session_state.get("rubric") else {}
 
     if not ipynbs:
         st.warning("No .ipynb files found in the upload.")
@@ -187,20 +180,20 @@ if run_clicked and subs_file:
                     timeout_per_cell=int(cell_timeout),
                     data_zip=data_zip_bytes,
                     extra_requirements_txt=req_bytes,
-                    probes=probes,
+                    probes=None,                   # LLM-only mode: no deterministic probes
                     retry_on_timeout=retry_timeout,
                     skip_tags=skip_tags,
                 )
             except TypeError:
-                # Older notebook_exec without probes/controls support
+                # Backward-compat signature without the extra args
                 res = run_ipynb_bytes(
                     data,
                     timeout_per_cell=int(cell_timeout),
                     data_zip=data_zip_bytes,
                     extra_requirements_txt=req_bytes,
                 )
-                # synthesize empty probe results so downstream code doesn’t break
                 res.probe_results = {}
+
             spans = split_sections(res.executed_nb)
             st.session_state["executions"].append(
                 {
@@ -209,15 +202,13 @@ if run_clicked and subs_file:
                     "duration_s": res.duration_s,
                     "errors": res.errors,
                     "sections": spans,
-                    "probe_results": getattr(res, "probe_results", {}),
-                    # keep the executed notebook around in case we want artifact counts later
                     "executed_nb": res.executed_nb,
                 }
             )
             progress.progress(i / len(ipynbs))
         st.success(f"Executed {len(ipynbs)} notebook(s).")
 
-# ---- Preview executions (basic, clean) ----
+# Preview
 for info in st.session_state["executions"]:
     st.markdown(f"### 📄 {info['name']}")
     cols = st.columns([1, 2, 2])
@@ -232,7 +223,7 @@ for info in st.session_state["executions"]:
             st.success("✅ No execution errors")
         if info["sections"]:
             st.write("Detected sections:")
-            st.code(", ".join(sorted(info["sections"].keys())), language="text")
+            st.code(", ".join(info["sections"].get("_order", [])) or "—", language="text")
         else:
             st.write("No Q-sections detected")
     with cols[1]:
@@ -243,52 +234,101 @@ for info in st.session_state["executions"]:
         st.json(info["sections"])
 
 # ----------------------------
-# Deterministic grading
+# LLM grading per section
 # ----------------------------
 st.divider()
-st.subheader("Grading (deterministic checks)")
+st.subheader("Grading (LLM per section)")
 
-grade_disabled = not st.session_state.get("rubric") or not st.session_state.get("executions")
-grade_clicked = st.button("🧮 Grade all (deterministic)", disabled=grade_disabled, type="primary")
+# Check for OpenAI secrets
+OPENAI_OK = "openai" in st.secrets and "api_key" in st.secrets["openai"]
+if not OPENAI_OK:
+    st.info(
+        "Set your OpenAI key in secrets:\n\n"
+        "```toml\n[openai]\napi_key = \"sk-...\"\nmodel = \"gpt-4o-mini\"\n```"
+    )
 
-if grade_clicked:
-    rubric = st.session_state.get("rubric")
+grade_disabled = (not st.session_state.get("rubric")
+                  or not st.session_state.get("executions")
+                  or not OPENAI_OK)
+
+if st.button("🤖 Grade all (LLM)", disabled=grade_disabled, type="primary"):
+    from openai import OpenAI
+    client = OpenAI(api_key=st.secrets["openai"]["api_key"])
+    model = st.secrets["openai"].get("model", "gpt-4o-mini")
+    rubric = st.session_state["rubric"]
+
     results = []
     for info in st.session_state["executions"]:
-        det = evaluate(rubric, info.get("probe_results", {}))  # (figure_exists via HTML can be added later)
-        # attach feedback bullets per section
-        for sec in det["sections"]:
-            sec["feedback"] = feedback_from_scores(sec)
-        results.append({"name": info["name"], "deterministic": det})
-    st.session_state["grading_results"] = results
-    st.success("Grading complete.")
+        spans = info["sections"]
+        nb = info["executed_nb"]
+        html = info["html"]
+        per_sections = []
+        for qid in spans.get("_order", []):
+            ctx = build_section_context(nb, spans[qid], html)
+            graded = grade_section_llm(client, model, rubric, qid, ctx, temperature=0.0)
+            per_sections.append(graded)
+        total_max = sum(s["total_points"] for s in per_sections)
+        total_earned = sum(s["earned_points"] for s in per_sections)
+        results.append({
+            "name": info["name"],
+            "sections": per_sections,
+            "total": {"max": total_max, "earned": total_earned},
+        })
+    st.session_state["llm_results"] = results
+    st.success("LLM grading complete.")
 
-# ---- Results viewer ----
-if st.session_state.get("grading_results"):
-    for r in st.session_state["grading_results"]:
+# Results viewer + simple overrides
+if st.session_state.get("llm_results"):
+    for r in st.session_state["llm_results"]:
         st.markdown(f"### 🧾 {r['name']}")
-        det = r["deterministic"]
-        st.caption(f"Total: **{det['total']['earned']:.2f} / {det['total']['max']:.2f}**")
-        for sec in det["sections"]:
-            with st.expander(f"{sec['id']} — {sec['earned']:.2f} / {sec['max']:.2f}", expanded=False):
-                st.markdown("**Criteria**")
-                st.dataframe(
+        # running total with possible overrides
+        total_earned_override = 0.0
+        total_max = r["total"]["max"]
+
+        for sec in r["sections"]:
+            with st.expander(f"{sec['section_id']} — {sec['earned_points']:.2f} / {sec['total_points']:.2f}", expanded=False):
+                st.markdown(f"**{sec.get('rubric_title','')}**")
+                # Per-criterion view
+                df = pd.DataFrame(
                     [{
-                        "criterion_id": row["id"],
-                        "score": row["score"],
-                        "max": row["max"],
-                        "why": row["justification"],
-                    } for row in sec["rows"]],
-                    hide_index=True, use_container_width=True
+                        "criterion_id": c["criterion_id"],
+                        "label": c["label"],
+                        "score": c["score"],
+                        "max": c["max"],
+                        "why": c["rationale"],
+                        "tip": c.get("improvement_tip",""),
+                    } for c in sec["criteria"]]
                 )
-                st.markdown("**Feedback**")
-                for b in sec.get("feedback", []):
-                    st.write("- " + b)
+                st.dataframe(df, hide_index=True, use_container_width=True)
+
+                st.markdown("**Overall comment**")
+                st.write(sec.get("overall_comment",""))
+
+                # Optional manual override at section level
+                if "overrides" not in st.session_state:
+                    st.session_state["overrides"] = {}
+                key = f"{r['name']}::{sec['section_id']}"
+                default_val = float(sec["earned_points"])
+                new_val = st.number_input(
+                    f"Override score for {sec['section_id']} (0–{sec['total_points']})",
+                    min_value=0.0,
+                    max_value=float(sec["total_points"]),
+                    value=st.session_state["overrides"].get(key, default_val),
+                    step=0.5,
+                    key=f"override_{key}"
+                )
+                st.session_state["overrides"][key] = new_val
+                total_earned_override += float(new_val)
+
+        st.caption(
+            f"Total (LLM): **{r['total']['earned']:.2f} / {total_max:.2f}**  •  "
+            f"Total (with overrides): **{total_earned_override:.2f} / {total_max:.2f}**"
+        )
 
 st.divider()
-st.subheader("Next steps")
+st.subheader("Next")
 st.markdown(
-    "- **LLM grading pass** (compare vs deterministic and flag mismatches).\n"
-    "- **Editable scores & comments** before finalizing.\n"
-    "- **Student report export** (HTML/PDF) and CSV of grades."
+    "- Export per-student reports (PDF/HTML) and a CSV of final scores.\n"
+    "- Add rubric-level few-shots in `args_json` to tighten consistency.\n"
+    "- Optional: add discrepancy flags if you later enable any deterministic checks."
 )
