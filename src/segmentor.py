@@ -1,117 +1,130 @@
 # src/segmentor.py
 from __future__ import annotations
 import re
-from typing import Dict, List, Any
+from typing import Dict, Any, List
 import nbformat
 
-_Q_HDR_RE = re.compile(
-    r"""^                # start of line
-        \s{0,3}          # optional leading spaces
-        (?:\#{1,6}\s*)?  # optional markdown heading marks like #, ##, ...
-        (?:Q|Question)\s* # Q or Question
-        (?P<num>\d{1,2})  # the number
-        \b                # word boundary
+# Very tolerant markers
+_Q_LINE_RE = re.compile(
+    r"""
+    ^\s{0,4}                # optional leading spaces
+    (?:\#{1,6}\s*)?         # optional markdown heading marks
+    (?:>+\s*)?              # optional blockquote
+    (?:[-*]\s*)?            # optional bullet
+    (?:\*\*|__)?\s*         # optional bold open
+    (?:Q|Question)\s*       # Q or Question
+    (?P<num>\d{1,2})        # number
+    [):.\-\s]*              # trailing punctuation/space
+    (?:\*\*|__)?\s*$        # optional bold close, optional trailing space
     """,
     re.IGNORECASE | re.VERBOSE,
 )
 
-# Also catch code/comment forms like "# Q3", "# Question 7", "#--- Q5 ---"
 _Q_CODE_RE = re.compile(
-    r"""(?:
-            ^\s*#\s*                 # start of line, comment
-         |  ^\s*['"]{3}.*?\n         # or start of a triple-quoted block (rare)
-        )
-        \s*(?:Q|Question)\s*(?P<num>\d{1,2})\b
+    r"""
+    ^\s*#\s*
+    (?:
+        AUTOGRADE:\s*(?:Q|Question)\s*(?P<num1>\d{1,2})
+        |
+        (?:Q|Question)\s*(?P<num2>\d{1,2})
+    )
+    \b
     """,
-    re.IGNORECASE | re.VERBOSE | re.MULTILINE,
+    re.IGNORECASE | re.VERBOSE,
 )
 
-def _cell_has_q_mark(cell, regex) -> int | None:
-    src = (cell.get("source") or "").strip()
+def _find_q_in_markdown(src: str) -> int | None:
     if not src:
         return None
-    m = regex.search(src.splitlines()[0])  # check first line for headings
-    if m:
-        try:
-            return int(m.group("num"))
-        except Exception:
-            return None
+    # check first up to 3 non-empty lines
+    lines = [ln.strip() for ln in src.splitlines()]
+    picked = []
+    for ln in lines:
+        if ln.strip():
+            picked.append(ln)
+        if len(picked) >= 3:
+            break
+    for ln in picked:
+        m = _Q_LINE_RE.match(ln)
+        if m:
+            n = m.group("num")
+            try:
+                return int(n)
+            except Exception:
+                return None
     return None
 
-def _cell_has_q_comment(cell, regex) -> int | None:
-    src = (cell.get("source") or "")
+def _find_q_in_code(src: str) -> int | None:
     if not src:
         return None
-    m = regex.search(src)
-    if m:
-        try:
-            return int(m.group("num"))
-        except Exception:
-            return None
+    for ln in src.splitlines():
+        m = _Q_CODE_RE.match(ln)
+        if m:
+            num = m.group("num1") or m.group("num2")
+            try:
+                return int(num)
+            except Exception:
+                return None
     return None
 
 def split_sections(nb: nbformat.NotebookNode) -> Dict[str, Any]:
     """
-    Scan a (possibly executed) notebook and return a dict:
+    Return:
     {
-      "Q1": {"title": "Q1 ...", "start": 3, "end": 9, "cell_idxs": [3..9]},
-      "Q2": {...},
+      "Q1": {"title": "Q1 …", "start": i, "end": j, "cell_idxs": [...]} ,
       ...
       "_order": ["Q1","Q2",...]
     }
-
-    Rules:
-    - A section starts at a Markdown heading like '# Q3 ...' or '## Question 3 ...'
-      OR at a code cell starting with a comment '# Q3'.
-    - A section ends right before the next section's start (or at the last cell).
-    - Titles are pulled from the heading line when present; otherwise 'Qn'.
     """
     if not nb or "cells" not in nb:
         return {}
 
-    boundaries: List[tuple[int, str, str]] = []  # (cell_idx, qid, title)
+    boundaries: List[tuple[int, str, str]] = []
     for i, cell in enumerate(nb["cells"]):
         ctype = cell.get("cell_type")
+        src = cell.get("source") or ""
+        num = None
+        title = None
+
         if ctype == "markdown":
-            num = _cell_has_q_mark(cell, _Q_HDR_RE)
+            num = _find_q_in_markdown(src)
             if num:
-                line0 = (cell.get("source") or "").splitlines()[0].strip()
-                title = line0.lstrip("#").strip() or f"Q{num}"
-                boundaries.append((i, f"Q{num}", title))
-                continue
+                # title: prefer the first non-empty line
+                first_nonempty = next((ln.strip() for ln in src.splitlines() if ln.strip()), "")
+                # strip leading markdown symbols
+                title = re.sub(r"^\s*(?:\#{1,6}\s*|>+\s*|[-*]\s*)", "", first_nonempty).strip()
+                if not title:
+                    title = f"Q{num}"
         elif ctype == "code":
-            num = _cell_has_q_comment(cell, _Q_CODE_RE)
+            num = _find_q_in_code(src)
             if num:
                 title = f"Q{num}"
-                boundaries.append((i, f"Q{num}", title))
-                continue
 
-    # If nothing found, return empty
+        if num:
+            boundaries.append((i, f"Q{num}", title or f"Q{num}"))
+
     if not boundaries:
         return {}
 
-    # Deduplicate in case of repeated markers
-    deduped: List[tuple[int, str, str]] = []
-    seen = set()
-    for tup in boundaries:
-        if (tup[0]) in seen:
+    boundaries.sort(key=lambda x: x[0])
+
+    # coalesce duplicates if someone marks the same Q multiple times
+    dedup: List[tuple[int, str, str]] = []
+    seen_qids: set[str] = set()
+    for b in boundaries:
+        if b[1] in seen_qids:
             continue
-        deduped.append(tup)
-        seen.add(tup[0])
+        dedup.append(b)
+        seen_qids.add(b[1])
 
-    deduped.sort(key=lambda x: x[0])
-
-    # Build spans
     out: Dict[str, Any] = {"_order": []}
-    for idx, (start_idx, qid, title) in enumerate(deduped):
-        end_idx = (deduped[idx + 1][0] - 1) if (idx + 1 < len(deduped)) else (len(nb["cells"]) - 1)
-        cell_idxs = list(range(start_idx, end_idx + 1))
-        # If the first cell is the heading itself, keep it; graders may read it for context.
+    for idx, (start_idx, qid, title) in enumerate(dedup):
+        end_idx = dedup[idx + 1][0] - 1 if idx + 1 < len(dedup) else (len(nb["cells"]) - 1)
         out[qid] = {
             "title": title,
             "start": start_idx,
             "end": end_idx,
-            "cell_idxs": cell_idxs,
+            "cell_idxs": list(range(start_idx, end_idx + 1)),
         }
         out["_order"].append(qid)
 
