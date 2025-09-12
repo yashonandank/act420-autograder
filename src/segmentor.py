@@ -1,38 +1,25 @@
-import re
-
 def split_sections(nb, rubric=None):
     """
-    Split notebook cells into sections based on rubric-defined section IDs.
-    
-    Args:
-        nb: executed notebook dict
-        rubric: rubric dict loaded by load_rubric_json/load_rubric_excel
-    
-    Returns:
-        dict: {section_id: [cells]}
+    Split a notebook into sections by looking for rubric section IDs in markdown cells.
+    Falls back to Q1/Q2 detection if rubric is not provided.
     """
     spans = {}
     current = None
 
-    # Build regex patterns directly from rubric section IDs if provided
-    section_ids = []
-    if rubric:
-        section_ids = [s["id"] for s in rubric.get("sections", [])]
-
     for cell in nb["cells"]:
         if cell["cell_type"] == "markdown":
-            text = "".join(cell["source"]).strip()
-
-            # Match rubric-defined section IDs
-            for sec in section_ids:
-                # Allow slight markdown variations (#, ##, bold, etc.)
-                if re.search(rf"\b{re.escape(sec)}\b", text, re.IGNORECASE):
-                    current = sec
-                    if current not in spans:
+            txt = "".join(cell.get("source", []))
+            if rubric:
+                # Look for exact rubric section IDs
+                for sec in rubric["sections"]:
+                    if sec["id"] in txt:
+                        current = sec["id"]
                         spans[current] = []
-                    break
-
+            else:
+                # Fallback heuristic (Q1, Q2, etc.)
+                if txt.strip().startswith("Q"):
+                    current = txt.strip().split()[0]
+                    spans[current] = []
         if current:
             spans[current].append(cell)
-
     return spans
