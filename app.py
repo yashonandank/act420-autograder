@@ -251,7 +251,7 @@ with tab_run:
                     res = run_ipynb_bytes(raw, timeout_per_cell=int(cell_timeout))
                     res.probe_results = {}
 
-                spans = split_sections(res.executed_nb)
+                spans = split_sections(res.executed_nb, rubric=st.session_state.get("rubric"))
                 executions[sid] = {
                     "student_id": sid,
                     "student_name": sname,
