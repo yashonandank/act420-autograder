@@ -423,6 +423,7 @@ with tab_reports:
         )
 
 # ---------- Analytics ----------
+# ---------- Analytics ----------
 with tab_analytics:
     st.subheader("Class-wide analytics")
     if not llm_results:
@@ -431,25 +432,29 @@ with tab_analytics:
         rows = []
         for sid, res in llm_results.items():
             for sec in res["sections"]:
-                key = f"{sid}::{sec['section_id']}"
+                key = f"{sid}::{sec.get('section_id','?')}"
                 score = overrides.get(key, sec["earned_points"])
                 rows.append({
                     "student_id": sid,
                     "student_name": res["student_name"],
-                    "section_id": sec["section_id"],   # ✅ always included
+                    "section_id": sec.get("section_id", "Unknown"),  # <- make sure this exists
                     "score": float(score),
                     "max": float(sec["total_points"]),
                 })
         df = pd.DataFrame(rows)
-        st.dataframe(df, use_container_width=True, hide_index=True)
 
-        agg = df.groupby("section_id").agg(
-            n=("score","count"),
-            mean=("score","mean"),
-            max=("max","first")
-        ).reset_index()
-        agg["pct_mean"] = (agg["mean"] / agg["max"]) * 100.0
-        st.markdown("#### Section summary")
-        st.dataframe(agg, use_container_width=True, hide_index=True)
-        st.markdown("#### Mean % by section")
-        st.bar_chart(agg.set_index("section_id")["pct_mean"])
+        if "section_id" not in df.columns:
+            st.error("No section_id found in grading results — check rubric or LLM grader output.")
+        else:
+            st.dataframe(df, width="stretch", hide_index=True)
+
+            agg = df.groupby("section_id").agg(
+                n=("score","count"),
+                mean=("score","mean"),
+                max=("max","first")
+            ).reset_index()
+            agg["pct_mean"] = (agg["mean"] / agg["max"]) * 100.0
+            st.markdown("#### Section summary")
+            st.dataframe(agg, width="stretch", hide_index=True)
+            st.markdown("#### Mean % by section")
+            st.bar_chart(agg.set_index("section_id")["pct_mean"])
