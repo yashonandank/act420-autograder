@@ -313,7 +313,12 @@ with tab_grade:
                     sec_id = sec["id"]
                     if sec_id not in spans:
                         continue  # skip if this section wasn't detected
-                    ctx = build_section_context(nb, spans[sec_id], html)
+                    span = spans.get(sec_id, {})
+                    # if it's a list of cell indices, wrap it into a dict
+                    if isinstance(span, list):
+                        span = {"cell_idxs": span}
+
+                    ctx = build_section_context(nb, span, html)
                     graded = grade_section_llm(client, model, rubric, sec_id, ctx, temperature=0.0)
                     per_sections.append(graded)
                 total_max = sum(s["total_points"] for s in per_sections)
