@@ -229,8 +229,10 @@ def grade_section_llm(
     # Clamp to section total
     earned_sum = max(0.0, min(float(earned_sum), float(total_max)))
 
+    safe_section_id = str(parsed.get("section_id") or section_id or "Unknown")
+
     return {
-        "section_id": section_id,
+        "section_id": safe_section_id,
         "rubric_title": rsec.get("title", ""),
         "total_points": float(total_max),
         "earned_points": float(earned_sum),
