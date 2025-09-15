@@ -20,7 +20,7 @@ def _sha16(s: str) -> str:
 
 def _rubric_slice(rubric: Dict[str, Any], section_id: str) -> Dict[str, Any]:
     for s in rubric.get("sections", []):
-        if s.get("id") == section_id:
+        if s.get("id") == section_id or s.get("title") == section_id:
             return s
     # fallback if section not in rubric
     return {"id": section_id, "title": section_id, "points": 0.0, "criteria": []}
