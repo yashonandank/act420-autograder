@@ -436,7 +436,7 @@ with tab_analytics:
                 rows.append({
                     "student_id": sid,
                     "student_name": res["student_name"],
-                    "section_id": sec["section_id"],
+                    "section_id": sec["section_id"],   # ✅ always included
                     "score": float(score),
                     "max": float(sec["total_points"]),
                 })
