@@ -309,9 +309,12 @@ with tab_grade:
                 spans = info["sections"]
                 nb = info["executed_nb"]; html = info["html"]
                 per_sections = []
-                for qid in spans.get("_order", []):
-                    ctx = build_section_context(nb, spans[qid], html)
-                    graded = grade_section_llm(client, model, rubric, qid, ctx, temperature=0.0)
+                for sec in rubric.get("sections", []):
+                    sec_id = sec["id"]
+                    if sec_id not in spans:
+                        continue  # skip if this section wasn't detected
+                    ctx = build_section_context(nb, spans[sec_id], html)
+                    graded = grade_section_llm(client, model, rubric, sec_id, ctx, temperature=0.0)
                     per_sections.append(graded)
                 total_max = sum(s["total_points"] for s in per_sections)
                 total_earned = sum(s["earned_points"] for s in per_sections)
